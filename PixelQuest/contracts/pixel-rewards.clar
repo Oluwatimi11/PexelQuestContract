@@ -17,7 +17,13 @@
 (define-constant MAX-INVENTORY-SLOTS u50)
 (define-constant ERR-INVALID-QUESTS u100) ;; Example error code for invalid quests
 (define-constant ERR-INVALID-ARENAS u101) ;; Example error code for invalid arenas
-
+(define-constant ACHIEVEMENT-TYPES (list 
+    "quest_master"     ;; Complete X quests
+    "arena_champion"   ;; Win X arena battles
+    "pixel_collector"  ;; Collect X pixel-coins
+    "alliance_leader"  ;; Lead an alliance for X blocks
+    "item_collector"   ;; Collect X different items
+))
 
 ;; Error Codes
 (define-constant ERR-NOT-AUTHORIZED (err u101))
@@ -47,6 +53,9 @@
 (define-constant ERR-NOT-ALLIANCE-LEADER (err u125))
 (define-constant ERR-ALREADY-IN-ALLIANCE (err u126))
 (define-constant ERR-NOT-IN-ALLIANCE (err u127))
+(define-constant ERR-ACHIEVEMENT-EXISTS (err u128))
+(define-constant ERR-INVALID-ACHIEVEMENT-TYPE (err u129))
+
 
 ;; ============= SFT Definitions =============
 (define-fungible-token pixel-coin)
@@ -166,6 +175,30 @@
     { alliance-id: uint }
 )
 
+(define-map Achievements
+    { achievement-id: uint }
+    {
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        achievement-type: (string-ascii 15),
+        requirement: uint,
+        pixel-coin-reward: uint,
+        power-boost: uint,
+        created-at: uint
+    }
+)
+
+(define-map HeroAchievements
+    { hero: principal, achievement-id: uint }
+    {
+        completed: bool,
+        completion-block: uint,
+        progress: uint
+    }
+)
+
+(define-data-var achievement-counter uint u0)
+
 ;; ============= Security Functions =============
 (define-private (is-contract-owner)
     (is-eq tx-sender contract-owner)
@@ -283,6 +316,40 @@
 )
 
 
+;;============= Achievement Functions ========================
+(define-public (create-achievement
+    (name (string-ascii 50))
+    (description (string-ascii 200))
+    (achievement-type (string-ascii 15))
+    (requirement uint)
+    (pixel-coin-reward uint)
+    (power-boost uint)
+)
+    (begin
+        (try! (assert-not-paused))
+        (asserts! (is-game-master) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (index-of ACHIEVEMENT-TYPES achievement-type)) ERR-INVALID-ACHIEVEMENT-TYPE)
+        
+        (let ((new-achievement-id (+ (var-get achievement-counter) u1)))
+            (map-set Achievements
+                { achievement-id: new-achievement-id }
+                {
+                    name: name,
+                    description: description,
+                    achievement-type: achievement-type,
+                    requirement: requirement,
+                    pixel-coin-reward: pixel-coin-reward,
+                    power-boost: power-boost,
+                    created-at: block-height
+                }
+            )
+            
+            (var-set achievement-counter new-achievement-id)
+            (ok new-achievement-id)
+        )
+    )
+)
+
 (define-public (complete-pixel-quest (quest-id uint))
     (let (
         (hero-stats (unwrap! (map-get? PixelHeroStats { hero: tx-sender }) ERR-INVALID-PIXEL-HERO))
@@ -291,38 +358,55 @@
             { completed: false, completion-block: u0, times-completed: u0, last-reward: u0 }
             (map-get? HeroQuestLog { hero: tx-sender, quest-id: quest-id })))
     )
-        (asserts! (>= (get rank hero-stats) (get required-rank quest)) ERR-INVALID-RANK)
-        (asserts! (>= (- block-height (get last-quest-block hero-stats)) (get cooldown-blocks quest)) ERR-QUEST-COOLDOWN)
-        (asserts! (>= (get stamina hero-stats) (get stamina-cost quest)) ERR-INSUFFICIENT-STAMINA)
-        (asserts! (>= (get power hero-stats) (get power-requirement quest)) ERR-INVALID-PARAMETERS)
-        (asserts! (>= (get agility hero-stats) (get agility-requirement quest)) ERR-INVALID-PARAMETERS)
+        ;; Optimized validation checks in a single batch
+        (asserts! (and
+            (>= (get rank hero-stats) (get required-rank quest))
+            (>= (- block-height (get last-quest-block hero-stats)) (get cooldown-blocks quest))
+            (>= (get stamina hero-stats) (get stamina-cost quest))
+            (>= (get power hero-stats) (get power-requirement quest))
+            (>= (get agility hero-stats) (get agility-requirement quest))
+        ) ERR-INVALID-PARAMETERS)
         
-        (try! (mint-pixel-coins tx-sender (get pixel-coin-reward quest)))
-        
-        (map-set PixelHeroStats
-            { hero: tx-sender }
-            (merge hero-stats {
-                pixel-xp: (+ (get pixel-xp hero-stats) (get pixel-coin-reward quest)),
-                total-pixel-coins: (+ (get total-pixel-coins hero-stats) (get pixel-coin-reward quest)),
-                last-quest-block: block-height,
-                quests-completed: (+ (get quests-completed hero-stats) u1),
-                stamina: (- (get stamina hero-stats) (get stamina-cost quest))
-            })
+        ;; Batch update hero stats for better efficiency
+        (let (
+            (new-xp (+ (get pixel-xp hero-stats) (get pixel-coin-reward quest)))
+            (new-total-coins (+ (get total-pixel-coins hero-stats) (get pixel-coin-reward quest)))
+            (new-quests-completed (+ (get quests-completed hero-stats) u1))
+            (new-stamina (- (get stamina hero-stats) (get stamina-cost quest)))
         )
-        
-        (map-set HeroQuestLog
-            { hero: tx-sender, quest-id: quest-id }
-            (merge quest-log {
-                completed: true,
-                completion-block: block-height,
-                times-completed: (+ (get times-completed quest-log) u1),
-                last-reward: (get pixel-coin-reward quest)
-            })
+            ;; Mint rewards and update stats in a single transaction
+            (try! (mint-pixel-coins tx-sender (get pixel-coin-reward quest)))
+            
+            (map-set PixelHeroStats
+                { hero: tx-sender }
+                (merge hero-stats {
+                    pixel-xp: new-xp,
+                    total-pixel-coins: new-total-coins,
+                    last-quest-block: block-height,
+                    quests-completed: new-quests-completed,
+                    stamina: new-stamina
+                })
+            )
+            
+            ;; Update quest log
+            (map-set HeroQuestLog
+                { hero: tx-sender, quest-id: quest-id }
+                (merge quest-log {
+                    completed: true,
+                    completion-block: block-height,
+                    times-completed: (+ (get times-completed quest-log) u1),
+                    last-reward: (get pixel-coin-reward quest)
+                })
+            )
+            
+            ;; Check and update quest-related achievements
+            (try! (check-quest-achievements tx-sender new-quests-completed))
+            
+            (ok true)
         )
-        
-        (ok true)
     )
 )
+
 
 ;; ============= Enhanced Arena System =============
 (define-public (create-pixel-arena 
@@ -584,7 +668,98 @@
     (map-delete HeroAlliance { hero: hero })
 )
 
+
+;; Modify check-quest-achievements to not rely on get-all-achievements
+(define-private (check-quest-achievements (hero principal) (quests-completed uint))
+    (begin
+        ;; Check achievements sequentially
+        (try! (check-achievement-type-1 quests-completed))
+        (try! (check-achievement-type-2 quests-completed))
+        (try! (check-achievement-type-3 quests-completed))
+        (ok true)
+    )
+)
+
+(define-private (check-achievement-type-1 (quests-completed uint))
+    (let (
+        (achievement (unwrap! (map-get? Achievements { achievement-id: u1 }) (err u0)))
+    )
+        (if (and 
+            (is-eq (get achievement-type achievement) "quest_master")
+            (>= quests-completed (get requirement achievement))
+        )
+            (award-achievement u1)
+            (ok true)
+        )
+    )
+)
+
+(define-private (check-achievement-type-2 (quests-completed uint))
+    (let (
+        (achievement (unwrap! (map-get? Achievements { achievement-id: u2 }) (err u0)))
+    )
+        (if (and 
+            (is-eq (get achievement-type achievement) "quest_master")
+            (>= quests-completed (get requirement achievement))
+        )
+            (award-achievement u2)
+            (ok true)
+        )
+    )
+)
+
+(define-private (check-achievement-type-3 (quests-completed uint))
+    (let (
+        (achievement (unwrap! (map-get? Achievements { achievement-id: u3 }) (err u0)))
+    )
+        (if (and 
+            (is-eq (get achievement-type achievement) "quest_master")
+            (>= quests-completed (get requirement achievement))
+        )
+            (award-achievement u3)
+            (ok true)
+        )
+    )
+)
+
+(define-private (award-achievement (achievement-id uint))
+    (let (
+        (achievement (unwrap! (map-get? Achievements { achievement-id: achievement-id }) (err u0)))
+        (hero-achievement (default-to 
+            { completed: false, completion-block: u0, progress: u0 }
+            (map-get? HeroAchievements { hero: tx-sender, achievement-id: achievement-id })))
+    )
+        (if (get completed hero-achievement)
+            (ok true)
+            (begin
+                (try! (mint-pixel-coins tx-sender (get pixel-coin-reward achievement)))
+                (map-set HeroAchievements
+                    { hero: tx-sender, achievement-id: achievement-id }
+                    {
+                        completed: true,
+                        completion-block: block-height,
+                        progress: (get requirement achievement)
+                    }
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
 ;; ============= Read-Only Functions =============
+(define-read-only (get-achievement-count)
+    (var-get achievement-counter)
+)
+
+(define-read-only (get-achievement-by-id (achievement-id uint))
+    (map-get? Achievements { achievement-id: achievement-id })
+)
+
+(define-read-only (get-hero-achievement-status (hero principal) (achievement-id uint))
+    (map-get? HeroAchievements { hero: hero, achievement-id: achievement-id })
+)
+
 (define-read-only (get-contract-info)
     {
         owner: contract-owner,
@@ -611,15 +786,12 @@
     )
 )
 
-
 (define-read-only (get-hero-quests (hero principal))
-    (map-get? HeroQuestLog { hero: hero, quest-id: u0 })  ;; Assuming quest-id needs to be `u0` or another default value
+    (map-get? HeroQuestLog { hero: hero, quest-id: u0 })
 )
 
 
 (define-read-only (get-hero-arenas (hero principal))
-    ;; Implementation for getting hero's arena participation
-    ;; This would typically involve querying a separate data structure tracking arena participation
     (ok "Arena participation data")
 )
 
@@ -649,6 +821,22 @@
         (err ERR-ALLIANCE-NOT-FOUND)
     )
 )
+
+;; (define-read-only (get-all-achievements)
+;;     (let ((achievement-count (var-get achievement-counter)))
+;;         (map unwrap-uint 
+;;             (map to-uint 
+;;                 (range u1 (+ achievement-count u1))))
+;;     )
+;; )
+
+;; (define-private (unwrap-uint (n uint))
+;;     n
+;; )
+
+;; (define-private (to-uint (n int))
+;;     (to-uint n)
+;; )
 
 ;; ============= Error Handling =============
 (define-public (handle-error (error (response bool uint)))
